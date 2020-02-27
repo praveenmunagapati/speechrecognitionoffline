@@ -1,0 +1,106 @@
+<html>
+  <head> </head>
+
+  <body>
+	<input type="file" accept=".wav" onchange="onfileloaded(event)"></input>
+	<audio controls style="height:15px"></audio>
+	<br />
+	<pre>transcript will appear here</pre>
+	<button onclick="transcribe()">Transcribe</button>
+	<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.2.5/dist/tf.min.js"></script>
+	<script src="https://cdn.jsdelivr.net/npm/wavefile@11.0.0/dist/wavefile.js"></script>
+	<script>
+
+	function stft_abs_sq(signal, nfft, frameLength, frameStep, preemphasis)
+	{
+		const preemp = tf.concat([tf.slice1d(signal, 0, 1), tf.sub(tf.slice1d(signal, 1, signal.size - 1), tf.mul(tf.slice1d(signal, 0, signal.size - 1), preemphasis))]);
+		console.log('preemp done')
+		let framedSignal = tf.signal.frame(preemp, frameLength, frameStep);
+		console.log('framed done')
+		framedSignal = tf.concat([framedSignal, tf.zeros([framedSignal.shape[0], nfft - framedSignal.shape[1]])], 1);
+		console.log('padding done');
+		const windowedSignal = tf.mul(framedSignal, tf.signal.hannWindow(nfft));
+		console.log('windowing done');
+		const output = [];
+		for (let i = 0; i < framedSignal.shape[0]; i++)
+			output.push(tf.square(tf.abs(tf.rfft(windowedSignal.slice([i, 0], [1, nfft])))));
+		console.log('rfft done');
+		const concat = tf.concat(output);
+		console.log('concat done');
+		return tf.div(concat, nfft);
+	}
+	
+	function get_filterbanks(nfilt, nfft, samplerate)
+	{
+		const hz2mel = hz => 2595 * Math.log10(1+hz/700.);
+		const mel2hz = mel =>  tf.mul(700, tf.sub(tf.pow(10, tf.div(mel, 2595)), 1));
+
+		const lowfreq = 0;
+		const highfreq = samplerate / 2;
+		const lowmel = hz2mel(lowfreq);
+		const highmel = hz2mel(highfreq);
+		const melpoints = tf.linspace(lowmel,highmel,nfilt+2);
+		const bin = tf.floor(tf.mul(nfft+1, tf.div(mel2hz(melpoints), samplerate))).arraySync();
+
+		const fbank = tf.zeros([nfilt, nfft / 2 + 1]).arraySync();
+		for(let j = 0; j < nfilt; j++)
+		{
+			for(let i = Math.floor(bin[j]); i < Math.floor(bin[j+1]); i++)
+				fbank[j][i] = (i - bin[j]) / (bin[j+1]-bin[j])
+			for(let i = Math.floor(bin[j+1]); i < Math.floor(bin[j+2]); i++)
+				fbank[j][i] = (bin[j+2]-i) / (bin[j+2]-bin[j+1])
+		}
+		return tf.tensor(fbank);
+	}
+
+	const model = tf.loadLayersModel('w2l_plus_large_mp.tfjs/model.json');
+	const sample_rate = 16000;
+	const window_length = 20 * sample_rate / 1000;
+	const hop_length = 10 * sample_rate / 1000;
+	const nfft = 512;
+	const nfilt = 64;
+
+	function transcribe()
+	{
+		let reader = new FileReader();
+		reader.onload = async function() 
+		{
+			//const wav =  new WaveFile(new Uint8Array(reader.result));
+			const wav = new wavefile.WaveFile(new Uint8Array(reader.result));
+			
+			const pcm_int16 = new Int16Array(wav.data.samples.buffer);
+			const pcm_float32 = Float32Array.from(pcm_int16);
+			const pad = Math.floor((pcm_float32.length + sample_rate) / sample_rate) * sample_rate - pcm_float32.length;
+			const signal = tf.concat([tf.tensor(pcm_float32), tf.zeros([pad])]).squeeze();
+
+			console.log('before stft', tf.memory());
+
+			const pspec = tf.tidy(() => stft_abs_sq(signal, nfft, window_length, hop_length, 0.97));
+			console.log('pspec.shape', pspec.shape);
+			const mel_basis = get_filterbanks(nfilt, nfft, sample_rate).transpose();
+			const features = tf.log(tf.add(tf.matMul(pspec, mel_basis), 1e-20));
+
+			const m = tf.mean(features);
+			const s = tf.sqrt(tf.mean(tf.squaredDifference(features, m)));
+			const batch = tf.div(tf.sub(features, m), s);
+
+			console.log('before predict', tf.memory());
+			const scores = (await model).predict(batch.expandDims()).squeeze(0);
+			const decoded_greedy = scores.argMax(axis = 1).arraySync();
+			console.log('after predict', tf.memory());
+
+			const decoded_text = decoded_greedy.map(c => ({0 : ' ', 27 : "'", 28 : '|'})[c] || String.fromCharCode(c - 1 + 'a'.charCodeAt()));
+			console.log('decoded', decoded_text);
+			const postproc_text = decoded_text.filter((c, i) => (i == 0 || c != decoded_text[i - 1]) && c != '|').join('');
+			document.getElementsByTagName('pre')[0].innerText = postproc_text;
+		};
+		reader.readAsArrayBuffer(document.getElementsByTagName('input')[0].files[0]);
+	}
+
+	function onfileloaded(event)
+	{
+		document.getElementsByTagName('audio')[0].src = URL.createObjectURL(event.target.files[0]);
+	}
+	</script>
+  </body>
+</html>
